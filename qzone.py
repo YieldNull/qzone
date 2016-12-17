@@ -20,6 +20,10 @@ import sys
 import requests
 from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import PBKDF2
+from pymongo import MongoClient
+
+client = MongoClient()
+db = client.qzone
 
 base_headers = {
     'Accept': '*/*',
@@ -41,6 +45,11 @@ class LoginException(Exception):
             self.msg = msg
         else:
             self.msg = "未知错误。请重新登陆QQ空间并进入说说页面"
+
+
+class FetchException(Exception):
+    def __init__(self, msg):
+        self.msg = msg
 
 
 def chrome_cookies(host_key):
@@ -117,25 +126,6 @@ def chrome_cookies(host_key):
     return cookies
 
 
-def gen_url_mood(qq, gtk, pos, num):
-    """
-    生成获取说说API 的URL
-
-    :param qq: 说说所属者qq
-    :param gtk: 从cookie中的skey加密得来
-    :param pos: 偏移量，最新的一条说说记为0
-    :param num: 从pos开始，获取多少条纪录
-    :return: url
-    """
-    url = 'http://taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6?uin={qq}' \
-          '&inCharset=utf-8&outCharset=utf-8&hostUin={qq}' \
-          '&notice=0&sort=0&pos={pos}&num={num}' \
-          '&cgi_host=http%3A%2F%2Ftaotao.qq.com%2Fcgi-bin%2Femotion_cgi_msglist_v6' \
-          '&code_version=1&format=jsonp&need_private_comment=1&g_tk={gtk}'
-
-    return url.format(qq=qq, gtk=gtk, pos=pos, num=num)
-
-
 def gen_gtk(skey):
     """
     从cookie中的‘skey’计算出‘g_tk’
@@ -152,59 +142,133 @@ def gen_gtk(skey):
     return str(b & 2147483647)
 
 
-def decode_jsonp(jsonp):
-    """
-    将服务器返回的jsonp数据处理成json数据。
+class API:
+    def __init__(self, qq, gtk):
+        self.qq = qq
+        self.gtk = gtk
 
-    :param jsonp: jsonp格式的字符串：“_Callback(.*);”
-    :return: json格式的字符串
-    """
-    jsonp = jsonp.strip()
-    return jsonp[10:len(jsonp) - 2]
+    def url_journal(self, pos, num):
+        url = 'https://h5.qzone.qq.com/proxy/domain/b1.qzone.qq.com/cgi-bin/blognew/get_abs?' \
+              'hostUin={qq}&uin={qq}&blogType=0&cateName=&cateHex=' \
+              '&statYear=2016&reqInfo=7&pos={pos}&num={num}&sortType=0' \
+              '&source=0&ref=qzone' \
+              '&g_tk={gtk}&verbose=1'
+
+        return url.format(qq=self.qq, gtk=self.gtk, pos=pos, num=num)
+
+    def url_mood(self, pos, num):
+        """
+        生成获取说说API 的URL
+
+        :param pos: 偏移量，最新的一条说说记为0
+        :param num: 从pos开始，获取多少条纪录
+        :return: url
+        """
+        url = 'http://taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6?uin={qq}' \
+              '&inCharset=utf-8&outCharset=utf-8&hostUin={qq}' \
+              '&notice=0&sort=0&pos={pos}&num={num}' \
+              '&cgi_host=http%3A%2F%2Ftaotao.qq.com%2Fcgi-bin%2Femotion_cgi_msglist_v6' \
+              '&code_version=1&format=jsonp&need_private_comment=1&g_tk={gtk}'
+
+        return url.format(qq=self.qq, gtk=self.gtk, pos=pos, num=num)
 
 
-def fetch_mood(qq: int, handler):
-    """
-    获取所有可见说说，存入数据库或交由handler处理
+class Fetcher:
+    def __init__(self, qq):
+        self.qq = qq
+        self.cookies = chrome_cookies('.qq.com')
 
-    :param qq: 说说所属者qq
-    :param handler: 处理每次获取到的数据 handler(data : dict)
-    """
+        skey = self.cookies.get('skey')
+        if skey is None:
+            raise LoginException('请先登陆空间，并进入说说页面')
 
-    headers = base_headers.copy()
-    headers.update({
-        'Referer': 'http://ctc.qzs.qq.com/qzone/app/mood_v6/html/index.html',
-        'Host': 'taotao.qq.com'
-    })
+        gtk = gen_gtk(skey)
 
-    cookies = chrome_cookies('.qq.com')
-    skey = cookies.get('skey')
-    if skey is None:
-        raise LoginException('请先登陆空间，并进入说说页面')
+        self.api = API(qq, gtk)
 
-    gtk = gen_gtk(skey)
+    def fetch_mood(self, handler):
+        """
+        获取所有可见说说，存入数据库或交由handler处理
 
-    pos = 0
-    num = 40
+        :param handler: 处理每次获取到的数据 handler(data : dict)
+        """
 
-    def job():
-        url = gen_url_mood(qq, gtk, pos, num)
-        res = requests.get(url, headers=headers, cookies=cookies)
+        headers = base_headers.copy()
+        headers.update({
+            'Referer': 'http://ctc.qzs.qq.com/qzone/app/mood_v6/html/index.html',
+            'Host': 'taotao.qq.com'
+        })
+
+        name = self.qq
+        amount = 10000000
+        got = 0
+
+        pos = 0
+        num = 40
+        while pos < amount:
+            try:
+                data = self._http_request(pos, num, headers)
+            except FetchException as e:
+                print(e.msg, 'Retrying...')
+                continue
+
+            if data.get('msglist') is None:  # 被存档，不可见
+                return 0
+
+            msg_list = data['msglist']
+            _len = len(msg_list)
+
+            got += _len
+            if _len == 0:  # 结束，已获取全部
+                break
+
+            user_info = data['usrinfo']
+            name = user_info['name']
+            amount = user_info['msgnum']
+
+            handler(msg_list)  # 存储得到的数据
+            print('[MOOD] Amount:{:d}, Got: {:d}'.format(amount, got))
+
+            pos += num
+
+        return name, amount, got
+
+    @staticmethod
+    def _decode_jsonp(jsonp):
+        """
+        将服务器返回的jsonp数据处理成json数据。
+
+        :param jsonp: jsonp格式的字符串：“_Callback(.*);”
+        :return: json格式的字符串
+        """
+        jsonp = jsonp.strip()
+        return jsonp[10:len(jsonp) - 2]
+
+    def _http_request(self, pos, num, headers=base_headers):
+        """
+        发送HTTP请求
+        :param pos: pos in api
+        :param num: num in api
+        :param headers: http header
+        :return: 得到的JSON数据
+        """
+        url = self.api.url_mood(pos, num)
+        res = requests.get(url, headers=headers, cookies=self.cookies)
 
         code = res.status_code
-        source = decode_jsonp(res.text)
+        source = self._decode_jsonp(res.text)
 
         print('[HTTP {:d}] Position:{:d} '.format(code, pos))
 
+        # 无法正常获取或解析数据
         if code != 200:
-            raise LoginException()
-
+            raise FetchException('HTTP Request Failed')
         try:
             data = json.loads(source)
         except ValueError:
-            raise LoginException()
+            raise FetchException('Not A JSON FILE')
 
-        # 出现错误则会有message
+        # 正常解析数据，但返回 error message
         message = data.get('message')
         if message is None:
             raise LoginException()
@@ -213,50 +277,19 @@ def fetch_mood(qq: int, handler):
 
         return data
 
-    def parse_data(data):
-        if data.get('msglist') is None:  # 被存档，不可见
-            return 0
 
-        msg_list = data['msglist']
-        handler(msg_list)
-
-        print('[MOOD] Got {:d} moods'.format(len(msg_list)))
-
-        return len(msg_list)
-
-    name = str(qq)
-    amount = 10000000
-    got = 0
-
-    while pos < amount:
-        data = job()
-        n = parse_data(data)
-
-        got += n
-        if n == 0:
-            break
-
-        user_info = data['usrinfo']
-        name = user_info['name']
-        amount = user_info['msgnum']
-
-        pos += num
-
-    return name, amount, got
-
-
-def backup_mood(qq):
+def backup_mood(fetcher):
     """
     备份说说
-    :param qq: 主人qq
     """
 
     def mood_handler(data):
-        print(len(data))
+        db.mood.insert_many(data)
+        # print('[Mongodb] Store {:d} documents'.format(len(data)))
 
     try:
-        name, amount, got = fetch_mood(qq, mood_handler)
-        print('\nQQ:{:d} nickname:{:s} amount:{:d} got:{:d}\n'.format(qq, name, amount, got))
+        name, amount, got = fetcher.fetch_mood(mood_handler)
+        print('\nQQ:{:s} Nickname:{:s} Amount:{:d} Got:{:d}\n'.format(fetcher.qq, name, amount, got))
 
         if got != amount:
             print('The user archived some moods which are invisible.')
@@ -265,18 +298,19 @@ def backup_mood(qq):
         print(e.msg)
 
 
-def backup_journal(qq):
+def backup_journal(fetcher):
     """
     备份日志
-    :param qq: 主人qq
+    :param fetcher
     """
     raise Exception('Not yet implemented')
 
 
-def backup_photo(qq):
+def backup_photo(fetcher):
     """
     备份相册
-    :param qq: 主人qq
+
+    :param fetcher
     """
     raise Exception('Not yet implemented')
 
@@ -284,7 +318,7 @@ def backup_photo(qq):
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Backup qzone. http://qzone.qq.com')
+    parser = argparse.ArgumentParser(description='Backup qzone. https://github.com/YieldNull')
 
     parser.add_argument('-m', dest='mood', action='store_true',
                         help='Backup shuoshuo')
@@ -295,18 +329,22 @@ if __name__ == '__main__':
     parser.add_argument('-p', dest='photo', action='store_true',
                         help='Backup photo')
 
-    parser.add_argument('--qq', dest='qq', action='store', type=int, required=True,
-                        help='The qq number of the user you want to backup')
+    parser.add_argument('qq', metavar='QQ', type=int,
+                        help='The QQ number of the user you want to backup')
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
 
     args = parser.parse_args()
 
+    ft = Fetcher(str(args.qq))
+
     if args.mood:
-        backup_mood(args.qq)
+        backup_mood(ft)
 
     if args.journal:
-        backup_journal(args.qq)
+        backup_journal(ft)
 
     if args.photo:
-        backup_photo(args.qq)
-
-    print('job done.')
+        backup_photo(ft)
